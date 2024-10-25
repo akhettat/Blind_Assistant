@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.abspath('C:/Users/akhettat/Documents/Projets Python/B
 project = 'Blind Assistant'
 copyright = '2024, Amine KHETTAT'
 author = 'Amine KHETTAT'
-release = '0.0.1'
+release = '0.1'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
