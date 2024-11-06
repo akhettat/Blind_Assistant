@@ -8,6 +8,10 @@ __pycache__/
 
 # Distribution / packaging
 vosk-model-fr-0.6-linto-2.2.0/
+mixtral_8x7b/
+bloom_model/
+logs/
+temp_audio/
 .Python
 build/
 develop-eggs/

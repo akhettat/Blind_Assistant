@@ -1,191 +1,334 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-===============================================================================
-Voice Assistant Script with Silence Detection and Real-Time Audio Processing
-===============================================================================
-
-Description:
-    This script is a comprehensive implementation of a voice assistant designed
-    to operate offline, featuring real-time speech recognition, natural language
-    processing, and text-to-speech synthesis. The assistant uses the Wav2Vec2 
-    model for speech transcription and can respond to various commands using 
-    a local language model. It also includes silence detection to end audio 
-    capture after prolonged silence.
-
-Modules Used:
-    - sounddevice: Captures real-time audio input from the microphone.
-    - wav2vec2: Transcribes audio data using the Facebook Wav2Vec2 model.
-    - pyttsx3: Converts text responses to speech.
-    - keyboard: Enables activation and deactivation of the assistant using
-      keyboard shortcuts.
-
-Features:
-    - Offline speech recognition via Wav2Vec2 model.
-    - Real-time command processing.
-    - Dynamic responses using pre-trained language models.
-    - Activation toggle through keyboard shortcuts.
-    - Silence detection to end audio capture.
-
-Author: Amine Khettat
-Date Created: 22/10/2024
-Last Modified: 25/10/2024
-Version: 0.1
-
-===============================================================================
+BLINDY: Text-Based Assistant for Visually Impaired Users
+Uses pyttsx3 for offline text-to-speech with dynamic speed control and language switching
+:Author: Amine KHETTAT
+:Date: 2024-11-06
+:Version: 1.0
 """
 
 import os
-import queue
-import sounddevice as sd
-import pyttsx3
-import json
+import sys
 import threading
+from queue import Queue
+import logging
+from datetime import datetime
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+import pyttsx3
+import keyboard
 import time
-import keyboard  # For handling keyboard shortcuts
-import numpy as np
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Tokenizer, GPT2LMHeadModel, GPT2Tokenizer
-import torch
-import nltk  # Import de nltk
 
-# Configurer les paramètres audio
-sample_rate = 16000
-block_size = 16000
-amplitude_threshold = 0.02  # Seuil d'amplitude pour détecter la voix
-silence_limit = 2  # Temps en secondes pour détecter un silence prolongé
-
-# Charger les modèles Wav2Vec2 pour la transcription audio et GPT-2 pour les réponsesmodel_name = 
-model_name = "facebook/wav2vec2-base-960h"  #Name of the model used to transcript the acquired text
-tokenizer = Wav2Vec2Tokenizer.from_pretrained(model_name)
-wav2vec_model = Wav2Vec2ForCTC.from_pretrained(model_name)
-gpt_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-gpt_model = GPT2LMHeadModel.from_pretrained("gpt2")
-
-# Initialiser les files d'attente pour l'audio et la synthèse vocale
-q = queue.Queue()
-speech_queue = queue.Queue()  # Queue for managing speech synthesis
-
-# Flag pour indiquer si l'assistant est actif
-assistant_active = False  # Initialement inactif
-
-def toggle_assistant_state():
-    """
-    Active ou désactive l'assistant et annonce l'état actuel.
-    """
-    global assistant_active
-    assistant_active = not assistant_active
-    if assistant_active:
-        print("l'Assistant est activé")
-        speech_queue.put("l'assistant est activé")
-    else:
-        print("l'Assistant est désactivé")
-        speech_queue.put("l'assistant est désactivé")
-
-def speak_worker():
-    """
-    Fonction de travail qui traite la synthèse vocale depuis la file d'attente.
-    """
-    while True:
-        response = speech_queue.get()
-        if response is None:
-            break
-        print(f"Synthesizing speech: {response}")
+class EnhancedVoiceAssistant:
+    def __init__(self, model_path):
+        # Initialize basic components
+        self.setup_logging()
+        self.speech_queue = Queue()
+        self.stop_event = threading.Event()
+        self.is_speaking = threading.Event()
+        self.last_response = None
+        self.speech_rate = 250  # Faster default speech rate
+        self.current_engine = None  # Keep track of current engine
+        self.current_text = None  # Keep track of current text being spoken
         
+        # Set up language support
+        self.setup_languages()
+        
+        # Load model
+        print("Loading the AI model. This may take a few moments. Please wait...")
+        self.model_path = model_path
+        self.load_model()
+        
+        # Set up keyboard controls
+        self.setup_keyboard_handlers()
+
+    def setup_logging(self):
+        """Set up logging to track errors and usage"""
+        log_dir = "logs"
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        log_file = os.path.join(log_dir, f"assistant_{datetime.now().strftime('%Y%m%d')}.log")
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
+    def setup_languages(self):
+        """Initialize available languages and current language"""
+        # Get a temporary engine to get available voices
+        temp_engine = pyttsx3.init()
+        self.available_voices = temp_engine.getProperty('voices')
+        temp_engine.stop()
+        del temp_engine
+
+        # Store voice information
+        self.voices = []
+        for voice in self.available_voices:
+            # Get language code from voice ID (usually last 2 characters)
+            lang_code = voice.id[-2:].lower()
+            self.voices.append({
+                'id': voice.id,
+                'name': voice.name,
+                'lang_code': lang_code
+            })
+
+        # Set initial voice to first available
+        self.current_voice_index = 0
+        print("\nAvailable voices:")
+        for i, voice in enumerate(self.voices):
+            print(f"{i+1}. {voice['name']} ({voice['lang_code']})")
+
+    def cycle_voice(self):
+        """Switch to the next available voice"""
+        if len(self.voices) > 1:
+            self.current_voice_index = (self.current_voice_index + 1) % len(self.voices)
+            voice_info = self.voices[self.current_voice_index]
+            message = f"Switched to {voice_info['name']}"
+            print(f"System: {message}")
+            
+            # If currently speaking, restart with new voice
+            if self.current_text and self.is_speaking.is_set():
+                text_to_restart = self.current_text
+                self.stop_speaking()
+                self.speak_text(message)
+                self.speak_text(text_to_restart)
+            else:
+                self.speak_text(message)
+
+    def get_engine(self):
+        """Create a new TTS engine instance with current settings"""
         engine = pyttsx3.init()
-        engine.say(response)
-        engine.runAndWait()
-        engine.stop()
+        voice_id = self.voices[self.current_voice_index]['id']
+        engine.setProperty('voice', voice_id)
+        engine.setProperty('rate', self.speech_rate)
+        engine.setProperty('volume', 0.9)
+        return engine
+
+    def load_model(self):
+        """Load the BLOOM model with error handling"""
+        try:
+            # Initialize tokenizer with explicit truncation settings
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                truncation=True,
+                padding=True
+            )
+            
+            # Load the model
+            model = AutoModelForCausalLM.from_pretrained(self.model_path)
+            
+            # Create pipeline with proper tokenizer settings
+            self.generator = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=self.tokenizer,
+                truncation=True,
+                padding=True
+            )
+            
+            self.speak_text("Model loaded successfully.")
+            
+        except Exception as e:
+            error_msg = f"Error loading model: {str(e)}"
+            logging.error(error_msg)
+            print(error_msg)
+            sys.exit(1)
+
+    def setup_keyboard_handlers(self):
+        """Set up keyboard shortcuts for controlling the assistant"""
+        keyboard.add_hotkey('ctrl+q', self.quit_assistant)     # Quit application
+        keyboard.add_hotkey('esc', self.stop_speaking)         # Stop current speech
+        keyboard.add_hotkey('ctrl+r', self.repeat_last_response)  # Repeat last response
+        keyboard.add_hotkey('ctrl+s', lambda: self.adjust_speech_rate(25, restart_speech=True))   # Speed up
+        keyboard.add_hotkey('ctrl+d', lambda: self.adjust_speech_rate(-25, restart_speech=True))  # Slow down
+        keyboard.add_hotkey('ctrl+l', self.cycle_voice)        # Change language/voice
+
+    def adjust_speech_rate(self, change, restart_speech=False):
+        """Adjust the speech rate and optionally restart current speech"""
+        old_rate = self.speech_rate
+        self.speech_rate = max(50, min(400, self.speech_rate + change))  # Allow higher maximum speed
         
-        print(f"Finished speaking: {response}")
+        if self.speech_rate != old_rate:
+            message = f"Speech rate adjusted to {self.speech_rate}"
+            print(f"System: {message}")
+            
+            if restart_speech and self.current_text and self.is_speaking.is_set():
+                # Store the current text
+                text_to_restart = self.current_text
+                # Stop current speech
+                self.stop_speaking()
+                # Restart speech with new rate
+                self.speak_text(text_to_restart)
+            else:
+                # Just announce the rate change
+                self.speak_text(message)
+
+    def speak_text(self, text):
+        """Speak text using offline TTS"""
+        if self.stop_event.is_set():
+            return
+
+        print(f"Assistant: {text}")
+        self.current_text = text  # Store current text being spoken
+        
+        try:
+            # Clean up any existing engine
+            if self.current_engine:
+                try:
+                    self.current_engine.stop()
+                    del self.current_engine
+                except:
+                    pass
+            
+            # Create new engine instance
+            self.current_engine = self.get_engine()
+            self.is_speaking.set()
+            
+            # Set up callback for speech end
+            def onEnd(name, completed):
+                self.is_speaking.clear()
+                if completed:  # Only cleanup if speech completed normally
+                    self.current_text = None  # Clear current text
+                    try:
+                        self.current_engine.stop()
+                        del self.current_engine
+                        self.current_engine = None
+                    except:
+                        pass
+            
+            self.current_engine.connect('finished-utterance', onEnd)
+            self.current_engine.say(text)
+            self.current_engine.runAndWait()
+            
+        except Exception as e:
+            print(f"Error in speech processing: {str(e)}")
+            logging.error(f"Speech processing error: {str(e)}")
+            self.is_speaking.clear()
+            self.current_text = None
+        finally:
+            if not self.is_speaking.is_set() and self.current_engine:
+                try:
+                    self.current_engine.stop()
+                    del self.current_engine
+                    self.current_engine = None
+                except:
+                    pass
+
+    def generate_response(self, user_input):
+        """Generate response using the BLOOM model"""
+        try:
+            if not hasattr(self, 'generator'):
+                return "Model not properly initialized. Please restart the assistant."
+
+            response = self.generator(
+                user_input,
+                max_length=150,
+                num_return_sequences=1,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                truncation=True,
+                return_full_text=False
+            )[0]['generated_text']
+            
+            response_text = response.strip()
+            
+            if not response_text or response_text.isspace():
+                return "I apologize, but I couldn't generate a meaningful response. Could you please rephrase your question?"
+            
+            self.last_response = response_text
+            return response_text
+            
+        except Exception as e:
+            error_msg = f"Error generating response: {str(e)}"
+            logging.error(error_msg)
+            return "I apologize, but I encountered an error generating a response. Please try again."
+
+    def stop_speaking(self):
+        """Stop current speech output"""
+        self.stop_event.set()
+        
+        # Force stop current speech
+        if self.current_engine and self.is_speaking.is_set():
+            try:
+                self.current_engine.stop()
+                del self.current_engine
+                self.current_engine = None
+            except:
+                pass
+            
+        self.is_speaking.clear()
+        time.sleep(0.1)
+        print("System: Speech stopped.")
+        self.stop_event.clear()
+
+    def repeat_last_response(self):
+        """Repeat the last response"""
+        if self.last_response:
+            self.speak_text("Repeating last response:")
+            self.speak_text(self.last_response)
+        else:
+            self.speak_text("No previous response to repeat.")
+
+    def quit_assistant(self):
+        """Safely quit the assistant"""
+        self.stop_speaking()  # Stop any ongoing speech
+        self.speak_text("Shutting down assistant. Goodbye!")
         time.sleep(1)
+        logging.info("Assistant shutdown initiated by user")
+        
+        # Final cleanup
+        if self.current_engine:
+            try:
+                self.current_engine.stop()
+                del self.current_engine
+            except:
+                pass
+                
+        sys.exit(0)
 
-def generate_response(prompt):
-    """
-    Génère une réponse à partir du modèle GPT-2 en utilisant le texte fourni.
-    """
-    inputs = gpt_tokenizer(prompt, return_tensors="pt")
-    outputs = gpt_model.generate(**inputs, max_length=100)
-    response = gpt_tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return response
-
-def process_command(command_text):
-    """
-    Traite le texte de la commande reconnu et met une réponse dans la file d'attente de synthèse vocale.
-    """
-    print(f"Processing command: {command_text}")
-    if "heure" in command_text:
-        import datetime
-        now = datetime.datetime.now()
-        response = f"il est {now.hour} heure et {now.minute} minutes."
-    elif "bonjour" in command_text:
-        response = "bonjour, comment puis-je vous aider aujourd'hui ?"
-    else:
-        # Si la commande n'est pas spécifique, transmettre le texte au modèle GPT-2
-        response = generate_response(command_text)
-
-    print(f"Queuing response: {response}")
-    speech_queue.put(response)
-
-def callback(indata, frames, time, status):
-    """
-    Cette fonction de rappel est invoquée pour chaque bloc de données audio.
-    """
-    if status:
-        print(status, flush=True)
-    q.put(bytes(indata))
-
-# Capture et traitement audio en temps réel avec Wav2Vec2
-def recognize_and_respond():
-    """
-    Capture et traitement de l'audio en temps réel avec Wav2Vec2, avec détection de silence.
-    """
-    silence_duration = 0  # Durée du silence
-    with sd.RawInputStream(samplerate=sample_rate, blocksize=block_size, dtype='int16', channels=1, callback=callback):
-        print("Assistant is listening... Speak into the microphone.")
+    def run(self):
+        """Main loop of the assistant"""
+        welcome_message = """
+        Welcome to the Enhanced Voice Assistant!
+        You can use the following keyboard shortcuts:
+        - Press Escape to stop current speech
+        - Press Ctrl+R to repeat the last response
+        - Press Ctrl+Q to quit the assistant
+        - Press Ctrl+S to speed up speech (works during speech)
+        - Press Ctrl+D to slow down speech (works during speech)
+        - Press Ctrl+L to cycle through available voices
+        
+        Please enter your message and press Enter to begin.
+        """
+        
+        self.speak_text(welcome_message)
         
         while True:
-            if assistant_active:
-                data = q.get()
-                audio_data = np.frombuffer(data, dtype=np.int16)
-                audio_amplitude = np.abs(audio_data).mean()
+            try:
+                user_input = input("You: ").strip()
                 
-                print(f"Captured audio amplitude: {audio_amplitude:.4f}")
+                if user_input.lower() in ["quit", "exit", "stop"]:
+                    self.quit_assistant()
                 
-                # Détecte la voix et réinitialise le silence si le seuil est dépassé
-                if audio_amplitude > amplitude_threshold:
-                    silence_duration = 0
-                    print("Audio detected. Transcribing...")
+                if not user_input:
+                    self.speak_text("I didn't catch that. Please try again.")
+                    continue
+                
+                self.speak_text("Processing your request...")
+                response = self.generate_response(user_input)
+                self.speak_text(response)
 
-                    # Transcription directe depuis l'entrée audio
-                    audio_tensor = torch.tensor(audio_data, dtype=torch.float32).unsqueeze(0)
-                    input_values = tokenizer(audio_tensor.squeeze().numpy(), return_tensors="pt", padding="longest").input_values
-                    logits = wav2vec_model(input_values).logits
-                    predicted_ids = torch.argmax(logits, dim=-1)
-                    recognized_text = tokenizer.batch_decode(predicted_ids)[0]
-                    
-                    print(f"Recognized text: {recognized_text}")
-
-                    if recognized_text:
-                        process_command(recognized_text)
-                else:
-                    # Si le silence persiste au-delà de la limite
-                    silence_duration += 1 / sample_rate * block_size
-                    print(f"Silence duration: {silence_duration:.2f} seconds")
-                    if silence_duration >= silence_limit:
-                        print("Detected prolonged silence. Ending recording session.")
-                        break  # Arrête la capture après un silence prolongé
+            except KeyboardInterrupt:
+                self.quit_assistant()
+            except Exception as e:
+                error_msg = f"An error occurred: {str(e)}"
+                logging.error(error_msg)
+                self.speak_text(error_msg)
 
 if __name__ == "__main__":
-    """
-    Point d'entrée principal pour le script.
-    """
-    nltk.download('punkt')
-
-    threading.Thread(target=speak_worker, daemon=True).start()
-
-    # Configurer un raccourci clavier pour activer/désactiver l'assistant
-    keyboard.add_hotkey('ctrl+shift+a', toggle_assistant_state)
-
-    try:
-        recognize_and_respond()
-    except KeyboardInterrupt:
-        print("\nProgram interrupted by the user.")
-        speech_queue.put(None)  # Stop the speech worker thread
+    model_path = os.path.join(os.path.dirname(__file__), "bloom_model")
+    assistant = EnhancedVoiceAssistant(model_path)
+    assistant.run()

@@ -6,7 +6,7 @@ tokenizer = GPT2Tokenizer.from_pretrained(model_name)
 model = GPT2LMHeadModel.from_pretrained(model_name)
 
 # Générer du texte
-prompt = "Bonjour, assistant."
+prompt = "Bonjour, assistant. Es-tu prêt ?"
 inputs = tokenizer(prompt, return_tensors="pt")
 outputs = model.generate(inputs.input_ids, max_length=50, num_return_sequences=1)
 response = tokenizer.decode(outputs[0], skip_special_tokens=True)
